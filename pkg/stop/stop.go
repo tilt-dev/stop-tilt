@@ -30,35 +30,74 @@ func NewStopper() (Stopper, error) {
 	}, nil
 }
 
-func (s *Stopper) StopResource(ctx context.Context, resource string) error {
-	cmd, err := s.CmdForResource(ctx, resource)
+func (s *Stopper) Kill(pid int) error {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return errors.Wrapf(err, "finding process %d", pid)
+	}
+
+	// TODO: should probably send a SIGTERM first, and only kill if nothing happens
+	err = proc.Kill()
+	if err != nil {
+		return errors.Wrapf(err, "killing process %d", pid)
+	}
+	return nil
+}
+
+func (s *Stopper) StopResources(ctx context.Context, resources []string) error {
+	cmds, err := s.CmdsForResources(ctx, resources)
 	if err != nil {
 		return errors.Wrap(err, "getting cmd for resource")
 	}
 
-	return s.StopCmd(ctx, cmd)
-
+	for _, cmd := range cmds {
+		err = s.StopCmd(cmd)
+		if err != nil {
+			fmt.Printf("🚨 error stopping Cmd %q: %v\n", cmd.Name, err)
+		} else {
+			fmt.Printf("✅ successfully stopped Cmd %q\n", cmd.Name)
+		}
+	}
+	return nil
 }
-func (s *Stopper) CmdForResource(ctx context.Context, resource string) (*v1alpha1.Cmd, error) {
-	cmds, err := s.AllCmdsByResource(ctx)
+
+func (s *Stopper) CmdsForResources(ctx context.Context, resources []string) ([]*v1alpha1.Cmd, error) {
+	allCmds, err := s.AllCmdsByResource(ctx)
 	if err != nil {
 		return nil, errors.Wrap(err, "getting all Cmds")
 	}
-	cmd, ok := cmds[resource]
-	if !ok {
-		var allResources []string
-		for resource := range cmds {
-			allResources = append(allResources, resource)
-		}
-		return nil, fmt.Errorf("no Cmd found for resource %q (found Cmds for the following resources: %s)",
-			resource, strings.Join(allResources, ", "))
+
+	var allResourcesWithCmds []string
+	for resource := range allCmds {
+		allResourcesWithCmds = append(allResourcesWithCmds, resource)
 	}
-	return &cmd, nil
+
+	var ret []*v1alpha1.Cmd
+	var notFound []string
+	for _, resource := range resources {
+		cmd, ok := allCmds[resource]
+		if !ok {
+			notFound = append(notFound, resource)
+			continue
+		}
+		ret = append(ret, &cmd)
+	}
+
+	if len(notFound) > 0 {
+		fmt.Printf("🚨 no Cmd(s) found for resource(s): %s\n\t(found Cmds for the following resources: %s)\n",
+			strings.Join(notFound, ", "), strings.Join(allResourcesWithCmds, ", "))
+	}
+
+	if len(ret) == 0 {
+		return nil, fmt.Errorf("no Cmds found to stop")
+	}
+	return ret, nil
 }
+
 func (s *Stopper) AllCmdsByResource(ctx context.Context) (map[string]v1alpha1.Cmd, error) {
 	cmds, err := s.Cli.TiltV1alpha1().Cmds().List(ctx, v1.ListOptions{})
 	if err != nil {
-		return nil, errors.Wrap(err, "error watching tilt sessions")
+		return nil, errors.Wrap(err, "error listing Cmds")
 	}
 
 	ret := make(map[string]v1alpha1.Cmd, len(cmds.Items))
@@ -68,27 +107,22 @@ func (s *Stopper) AllCmdsByResource(ctx context.Context) (map[string]v1alpha1.Cm
 	return ret, nil
 }
 
-func (s *Stopper) StopCmd(ctx context.Context, cmd *v1alpha1.Cmd) error {
-	// fmt.Printf("🤖 deleting previous version of command %q\n", cmd.Name)
-	// err := s.Cli.TiltV1alpha1().Cmds().Delete(ctx, cmd.Name, v1.DeleteOptions{})
-	// if err != nil {
-	// 	return errors.Wrapf(err, "deleting existing cmd %q", cmd.Name)
-	// }
+func (s *Stopper) StopCmd(cmd *v1alpha1.Cmd) error {
 	if cmd.Status.Running == nil {
-		return fmt.Errorf("cannot stop Cmd %q because it's not currently running (Status: %+v)", cmd.Name, cmd.Status)
+		return fmt.Errorf("cannot stop Cmd because it's not currently running (Status: %+v)", cmd.Status)
 	}
 
 	pid := int(cmd.Status.Running.PID)
-	proc, err := os.FindProcess(pid)
+	return s.Kill(pid)
+}
+
+func (s *Stopper) StopTiltSession(ctx context.Context) error {
+	// TODO: multiple/differently-named sessions?
+	session, err := s.Cli.TiltV1alpha1().Sessions().Get(ctx, "Tiltfile", v1.GetOptions{})
 	if err != nil {
-		return errors.Wrapf(err, "finding process %d (for cmd %q)", pid, cmd.Name)
+		return errors.Wrap(err, "getting session `Tiltfile`")
 	}
 
-	// TODO: should probably send a SIGTERM first, and only kill if nothing happens
-	err = proc.Kill()
-	if err != nil {
-		return errors.Wrapf(err, "killing process %d (for cmd %q)", pid, cmd.Name)
-	}
-
-	return nil
+	pid := int(session.Status.PID)
+	return s.Kill(pid)
 }
